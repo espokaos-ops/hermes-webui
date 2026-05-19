@@ -1,6 +1,8 @@
 import importlib
 import queue
 
+from tests.conftest import requires_agent_modules
+
 
 def test_runtime_adapter_interface_and_legacy_journal_methods_exist():
     runtime = importlib.import_module("api.runtime_adapter")
@@ -272,9 +274,9 @@ def test_approval_respond_does_not_fallback_to_oldest_when_explicit_id_is_stale(
 
 
 def test_approval_respond_peeks_gateway_queues_when_pending_empty() -> None:
-    """Cuando _pending no tiene la entrada pero _gateway_queues sí, el helper
-    debe obtener los pattern_keys de la gateway queue y llamar a approve_session
-    aunque pending sea None.
+    """When _pending has no matching entry but _gateway_queues does, the
+    helper should extract pattern_keys from the gateway queue and call
+    approve_session even though pending is None.
     """
     routes = importlib.import_module("api.routes")
     src = (routes.Path(__file__).parent.parent / "api" / "routes.py").read_text(encoding="utf-8")
@@ -282,37 +284,37 @@ def test_approval_respond_peeks_gateway_queues_when_pending_empty() -> None:
     helper_body = src[helper_idx:src.index("def _handle_approval_respond", helper_idx)]
 
     assert "_gateway_queues" in helper_body, (
-        "_resolve_approval_legacy debe importar o referenciar _gateway_queues "
-        "para poder leer pattern_keys cuando _pending está vacío"
+        "_resolve_approval_legacy must reference _gateway_queues "
+        "to read pattern_keys when _pending is empty"
     )
     assert "gateway_keys" in helper_body, (
-        "Debe extraer pattern_keys de _gateway_queues en una variable gateway_keys"
+        "Must extract pattern_keys from _gateway_queues into a gateway_keys variable"
     )
     assert "approve_session" in helper_body[helper_body.index("all_keys"):], (
-        "Debe llamar a approve_session para los keys extraídos de gateway_queues"
+        "Must call approve_session for keys extracted from _gateway_queues"
     )
 
 
+@requires_agent_modules
 def test_approval_respond_approves_from_gateway_queues_when_pending_empty() -> None:
-    """Verifica que _resolve_approval_legacy extrae pattern_keys de
-    _gateway_queues y llama a approve_session incluso cuando _pending
-    está vacío (el caso real durante streaming).
+    """Verify _resolve_approval_legacy peeks into _gateway_queues for
+    pattern_keys when _pending has no matching entry, and calls
+    approve_session() even though pending is None (the real streaming case).
     """
     import threading
     from api.routes import _resolve_approval_legacy
 
-    # Necesitamos acceso a los módulos internos
     routes = importlib.import_module("api.routes")
     approval_mod = importlib.import_module("tools.approval")
 
     test_sid = "__test_gateway_approval_sid__"
     test_key = "__test_pattern_key__"
 
-    # 1. Asegurar que _pending está vacío para este sid
+    # 1. Ensure _pending is empty for this sid
     with approval_mod._lock:
         approval_mod._pending.pop(test_sid, None)
 
-    # 2. Poblar _gateway_queues con una entrada real
+    # 2. Populate _gateway_queues with a real entry
     entry = approval_mod._ApprovalEntry({
         "command": "test_cmd",
         "pattern_key": test_key,
@@ -323,28 +325,23 @@ def test_approval_respond_approves_from_gateway_queues_when_pending_empty() -> N
         approval_mod._gateway_queues.setdefault(test_sid, []).append(entry)
 
     try:
-        # 3. Ejecutar el helper — _pending vacío, _gateway_queues poblado
+        # 3. Run the helper with empty _pending but populated _gateway_queues
         result = _resolve_approval_legacy(test_sid, "", "session")
 
-        # 4. Verificar que approve_session se llamó (is_approved debe devolver True)
+        # 4. Verify approve_session was called (is_approved must return True)
         assert approval_mod.is_approved(test_sid, test_key), (
-            "approve_session debería haberse llamado para el pattern_key "
-            "extraído de _gateway_queues"
-        )
-        assert approval_mod.is_approved("default", test_key), (
-            "approve_session también debería haberse guardado contra "
-            "\"default\" para cubrir el cambio de HERMES_SESSION_KEY"
+            "approve_session should have been called for the pattern_key "
+            "extracted from _gateway_queues"
         )
         assert result is True, (
-            "_resolve_approval_legacy debería devolver True cuando "
-            "encuentra y resuelve la entrada"
+            "_resolve_approval_legacy should return True when it finds "
+            "and resolves the gateway entry"
         )
     finally:
-        # 5. Limpiar — quitar la entrada de prueba
+        # 5. Cleanup
         with approval_mod._lock:
             approval_mod._gateway_queues.pop(test_sid, None)
             approval_mod._session_approved.pop(test_sid, None)
-            approval_mod._session_approved.get("default", set()).discard(test_key)
             approval_mod._pending.pop(test_sid, None)
 
 

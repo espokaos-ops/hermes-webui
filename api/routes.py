@@ -8746,18 +8746,9 @@ def _resolve_approval_legacy(sid: str, approval_id: str, choice: str) -> bool:
     if choice in ("once", "session"):
         for k in all_keys:
             approve_session(sid, k)
-            # Bugfix: el session_key del agente puede ser "default" entre
-            # turnos de streaming porque HERMES_SESSION_KEY se limpia del
-            # entorno al finalizar. Guardar también contra "default" para
-            # que "Permitir en la sesión" funcione incluso después de que
-            # el streaming termine y el session_key se pierda.
-            if sid != "default":
-                approve_session("default", k)
     elif choice == "always":
         for k in all_keys:
             approve_session(sid, k)
-            if sid != "default":
-                approve_session("default", k)
             approve_permanent(k)
         save_permanent_allowlist(_permanent_approved)
     # Unblock the agent thread waiting in the gateway approval queue.
