@@ -38,6 +38,12 @@ let _pendingSettingsTargetPanel = null; // destination selected while settings h
 let _logsAutoRefreshTimer = null;
 let _lastLogsLines = [];
 let _logsSeverityFilter = 'all';
+let _lastLogsHint = '';
+let _lastLogsTruncated = false;
+let _lastLogsTotalBytes = 0;
+let _lastLogsMtime = null;
+let _logsLoadSeq = 0;
+let _logsVisibilityHookInstalled = false;
 
 // Map of panel names → i18n keys for the app titlebar label.
 const APP_TITLEBAR_KEYS = {
@@ -4376,8 +4382,10 @@ function _selectedLogsTail() {
 
 function _severityForLine(line) {
   const text = String(line || '').toUpperCase();
-  if (/\b(ERROR|CRITICAL|TRACEBACK)\b/.test(text)) return 'error';
+  // Same priority as _logLineSeverityClass: an explicit WARNING level token
+  // wins over incidental message text like "provider error".
   if (/\b(WARNING|WARN)\b/.test(text)) return 'warning';
+  if (/\b(ERROR|CRITICAL|TRACEBACK)\b/.test(text)) return 'error';
   if (/\b(DEBUG)\b/.test(text)) return 'debug';
   if (/\b(INFO)\b/.test(text)) return 'info';
   return 'other';
@@ -4396,8 +4404,11 @@ function _filteredLogsLines() {
 function _applyLogsSeverityFilter() {
   const el = $('logsSeverityFilter');
   _logsSeverityFilter = (el && el.value) || 'all';
-  // Re-render from cached lines without re-fetching
-  _renderLogs({ lines: _lastLogsLines, hint: '', truncated: false, _fromFilter: true });
+  // Re-render from cached lines without re-fetching, preserving the last
+  // fresh metadata (truncated/hint) so the truncation warning does not
+  // vanish until the next successful fetch.
+  _renderLogs({ lines: _lastLogsLines, hint: _lastLogsHint, truncated: _lastLogsTruncated,
+    total_bytes: _lastLogsTotalBytes, mtime: _lastLogsMtime, tail: _selectedLogsTail(), _fromFilter: true });
 }
 
 function _logLineSeverityClass(line) {
@@ -4426,13 +4437,34 @@ async function loadLogs(animate) {
   }
   const file = _selectedLogsFile();
   const tail = _selectedLogsTail();
+  const mySeq = ++_logsLoadSeq;
   try {
     if (status) status.textContent = t('logs_loading');
-    const data = await api('/api/logs?file=' + encodeURIComponent(file) + '&tail=' + encodeURIComponent(tail));
+    // Background poll: never navigate away to login (redirect401:false),
+    // bypass HTTP caches sharing the same URL, and fail fast so one slow
+    // fetch does not pile up overlapping polls.
+    const data = await api('/api/logs?file=' + encodeURIComponent(file) + '&tail=' + encodeURIComponent(tail),
+      { cache: 'no-store', redirect401: false, timeoutMs: 15000 });
+    // 401 unauthenticated (or other empty) responses resolve to undefined:
+    // keep the last good lines instead of wiping the panel with a TypeError.
+    if (data === undefined || data === null) {
+      if (status) status.textContent = t('logs_load_failed');
+      return;
+    }
+    // Drop stale out-of-order responses: only the newest poll may paint.
+    if (mySeq !== _logsLoadSeq) return;
     _renderLogs(data);
   } catch(e) {
-    _lastLogsLines = [];
-    box.innerHTML = `<div class="logs-empty">${esc(t('error_prefix') + e.message)}</div>`;
+    // Transient failure (timeout, 500, network): preserve the last good
+    // lines so a single bad tick does not blank the panel. Only show the
+    // empty state when we never had lines to keep. Failures stay diagnosable
+    // via status text plus a console warning (no toast spam on a 5s poll).
+    if (typeof console !== 'undefined' && console && typeof console.warn === 'function') {
+      try { console.warn('[logs] poll failed, keeping last good lines:', (e && e.message) || e); } catch (_) {}
+    }
+    if (!_lastLogsLines.length) {
+      box.innerHTML = `<div class="logs-empty">${esc(t('error_prefix') + (e && e.message || e))}</div>`;
+    }
     if (status) status.textContent = t('logs_load_failed');
   } finally {
     if (animate && refreshBtn) {
@@ -4446,10 +4478,16 @@ async function loadLogs(animate) {
 function _renderLogs(data) {
   const box = $('logsOutput');
   const status = $('logsStatus');
-  if (!box) return;
+  if (!box || data === undefined || data === null || typeof data !== 'object') return;
   const rawLines = Array.isArray(data && data.lines) ? data.lines : [];
   // Only update cache when loading fresh data (not when re-rendering from filter)
-  if (data && !data._fromFilter) _lastLogsLines = rawLines.slice();
+  if (data && !data._fromFilter) {
+    _lastLogsLines = rawLines.slice();
+    _lastLogsHint = data.hint || '';
+    _lastLogsTruncated = !!data.truncated;
+    _lastLogsTotalBytes = Number(data.total_bytes || 0);
+    _lastLogsMtime = data.mtime || null;
+  }
   const displayLines = _filteredLogsLines();
   const hint = data && data.hint ? `<div class="logs-hint">${esc(data.hint)}</div>` : '';
   const truncated = data && data.truncated ? `<div class="logs-hint warn">${esc(t('logs_truncated_hint'))}</div>` : '';
@@ -4474,6 +4512,17 @@ function _renderLogs(data) {
 
 function _startLogsAutoRefresh() {
   if (_logsAutoRefreshTimer) return;
+  // Catch up immediately when the tab becomes visible again: background
+  // throttling can delay the 5s interval for a minute or more.
+  if (!_logsVisibilityHookInstalled && typeof document !== 'undefined') {
+    _logsVisibilityHookInstalled = true;
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && _currentPanel === 'logs') {
+        const toggle = $('logsAutoRefresh');
+        if (!toggle || toggle.checked) loadLogs(false);
+      }
+    });
+  }
   _logsAutoRefreshTimer = setInterval(() => {
     if (_currentPanel !== 'logs') { _stopLogsAutoRefresh(); return; }
     const toggle = $('logsAutoRefresh');

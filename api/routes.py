@@ -12634,19 +12634,65 @@ def _handle_logs(handler, parsed) -> bool:
         st = log_path.stat()
         total_bytes = int(st.st_size)
         read_bytes = min(total_bytes, _LOG_MAX_BYTES)
+        seeked = total_bytes > read_bytes
         with log_path.open("rb") as fh:
-            if total_bytes > read_bytes:
-                fh.seek(total_bytes - read_bytes)
-            raw = fh.read(read_bytes)
+            # Use the open fd's own size: the path may have been replaced or
+            # shrunk between stat() and open() (rotation/truncation). The fd
+            # describes what we actually read.
+            try:
+                fd_size = int(os.fstat(fh.fileno()).st_size)
+            except OSError:
+                fd_size = total_bytes
+            if fd_size < 0:
+                fd_size = 0
+            read_bytes = min(fd_size, _LOG_MAX_BYTES)
+            seeked = fd_size > read_bytes
+            at_boundary = True
+            if seeked:
+                offset = fd_size - read_bytes
+                try:
+                    # If the byte just before the window is a newline, the
+                    # window already starts on a complete line: keep it.
+                    fh.seek(max(0, offset - 1))
+                    at_boundary = fh.read(1) == b"\n"
+                except OSError:
+                    at_boundary = False
+                try:
+                    fh.seek(offset)
+                except OSError:
+                    fh.seek(0)
+                    at_boundary = True
+                raw = fh.read(read_bytes)
+            else:
+                try:
+                    fh.seek(0)
+                except OSError:
+                    pass
+                raw = fh.read(read_bytes)
+            if seeked and not at_boundary:
+                # Drop only a genuinely partial first line: the seek offset
+                # landed mid-line (or mid-UTF-8 sequence). Never sacrifice a
+                # valid complete line to hide a fragment.
+                nl = raw.find(b"\n")
+                if nl != -1:
+                    raw = raw[nl + 1 :]
         text = raw.decode("utf-8", errors="replace")
         lines = text.splitlines()[-tail:]
+        try:
+            # Re-stat after the read so total_bytes/mtime describe the file
+            # as observed, not a stale pre-read snapshot (TOCTOU).
+            st_after = log_path.stat()
+            total_bytes = int(st_after.st_size)
+            mtime = st_after.st_mtime
+        except OSError:
+            mtime = st.st_mtime
         return j(handler, {
             "file": file_key,
             "tail": tail,
             "lines": lines,
             "truncated": total_bytes > read_bytes,
             "total_bytes": total_bytes,
-            "mtime": st.st_mtime,
+            "mtime": mtime,
             "hint": "",
         })
     except Exception as exc:
