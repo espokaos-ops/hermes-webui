@@ -44,6 +44,14 @@ let _lastLogsTotalBytes = 0;
 let _lastLogsMtime = null;
 let _logsLoadSeq = 0;
 let _logsVisibilityHookInstalled = false;
+// Ownership of the Logs panel: every poll is issued with a sequence number
+// and a (file, tail) identity. Successes paint only when newer than the last
+// painted result (never "latest issued": overlapping slow polls must still
+// paint). Failures settle only when no newer request was issued, so a late
+// error can never clobber a newer success, empty view or failure state.
+let _logsPaintedSeq = 0;
+let _lastLogsFile = null;
+let _lastLogsTail = null;
 
 // Map of panel names → i18n keys for the app titlebar label.
 const APP_TITLEBAR_KEYS = {
@@ -4380,15 +4388,22 @@ function _selectedLogsTail() {
   return [100,200,500,1000].includes(value) ? value : 200;
 }
 
-function _severityForLine(line) {
+// Single canonical severity for log lines. An explicit level token wins over
+// incidental message text (pre-existing coloring contract: WARNING → DEBUG →
+// INFO → ERROR, so `INFO provider error` paints as info). The severity filter
+// and the line coloring both derive from this function; change the order here
+// and both follow.
+function _logLineSeverity(line) {
   const text = String(line || '').toUpperCase();
-  // Same priority as _logLineSeverityClass: an explicit WARNING level token
-  // wins over incidental message text like "provider error".
   if (/\b(WARNING|WARN)\b/.test(text)) return 'warning';
-  if (/\b(ERROR|CRITICAL|TRACEBACK)\b/.test(text)) return 'error';
   if (/\b(DEBUG)\b/.test(text)) return 'debug';
   if (/\b(INFO)\b/.test(text)) return 'info';
+  if (/\b(ERROR|CRITICAL|TRACEBACK)\b/.test(text)) return 'error';
   return 'other';
+}
+
+function _severityForLine(line) {
+  return _logLineSeverity(line);
 }
 
 function _filteredLogsLines() {
@@ -4412,18 +4427,45 @@ function _applyLogsSeverityFilter() {
 }
 
 function _logLineSeverityClass(line) {
-  const text = String(line || '').toUpperCase();
-  if (/\b(WARNING|WARN)\b/.test(text)) return 'log-line-warning';
-  if (/\b(DEBUG)\b/.test(text)) return 'log-line-debug';
-  if (/\b(INFO)\b/.test(text)) return 'log-line-info';
-  if (/\b(ERROR|CRITICAL|TRACEBACK)\b/.test(text)) return 'log-line-error';
-  return '';
+  switch (_logLineSeverity(line)) {
+    case 'warning': return 'log-line-warning';
+    case 'debug': return 'log-line-debug';
+    case 'info': return 'log-line-info';
+    case 'error': return 'log-line-error';
+    default: return '';
+  }
 }
 
 function _syncLogsWrap() {
   const out = $('logsOutput');
   const wrap = $('logsWrap');
   if (out && wrap) out.classList.toggle('wrap', !!wrap.checked);
+}
+
+// Settle a failed logs request for the scope (file, tail) it was issued for.
+// A scope's own last-good lines survive (status still reports the failure);
+// a foreign or missing snapshot becomes an explicit empty/failed state, never
+// another file's data presented as this scope's.
+function _settleLogsFailure(file, tail, box, status, e) {
+  // A settlement for a scope that is no longer selected must not touch the
+  // panel at all: its status text and box belong to the current scope's own
+  // request, which is still in flight or already settled.
+  if (file !== _selectedLogsFile() || tail !== _selectedLogsTail()) return;
+  if (typeof console !== 'undefined' && console && typeof console.warn === 'function') {
+    try { console.warn('[logs] poll failed, keeping last good lines:', (e && e.message) || e || 'empty response'); } catch (_) {}
+  }
+  if (!(_lastLogsFile === file && _lastLogsTail === tail && _lastLogsLines.length)) {
+    _lastLogsLines = [];
+    _lastLogsHint = '';
+    _lastLogsTruncated = false;
+    _lastLogsTotalBytes = 0;
+    _lastLogsMtime = null;
+    _lastLogsFile = file;
+    _lastLogsTail = tail;
+    const msg = e ? (e.message || e) : t('logs_load_failed');
+    box.innerHTML = `<div class="logs-empty">${esc(t('error_prefix') + msg)}</div>`;
+  }
+  if (status) status.textContent = t('logs_load_failed');
 }
 
 async function loadLogs(animate) {
@@ -4437,35 +4479,53 @@ async function loadLogs(animate) {
   }
   const file = _selectedLogsFile();
   const tail = _selectedLogsTail();
+  // A new scope must never display the previous scope's snapshot as its own:
+  // drop the foreign lines immediately and show a neutral loading state
+  // until the fresh request settles (the settlement below re-checks identity
+  // for requests that were already in flight when the scope changed).
+  if (_lastLogsFile !== null && (_lastLogsFile !== file || _lastLogsTail !== tail)) {
+    _lastLogsLines = [];
+    _lastLogsHint = '';
+    _lastLogsTruncated = false;
+    _lastLogsTotalBytes = 0;
+    _lastLogsMtime = null;
+    _lastLogsFile = null;
+    _lastLogsTail = null;
+    box.innerHTML = `<div class="logs-empty">${esc(t('logs_loading'))}</div>`;
+  }
   const mySeq = ++_logsLoadSeq;
   try {
     if (status) status.textContent = t('logs_loading');
     // Background poll: never navigate away to login (redirect401:false),
     // bypass HTTP caches sharing the same URL, and fail fast so one slow
-    // fetch does not pile up overlapping polls.
+    // fetch does not pile up overlapping polls. Automatic polls stay silent
+    // on timeout (status text + console warning); manual refresh keeps the
+    // timeout toast so the click gets feedback.
     const data = await api('/api/logs?file=' + encodeURIComponent(file) + '&tail=' + encodeURIComponent(tail),
-      { cache: 'no-store', redirect401: false, timeoutMs: 15000 });
+      { cache: 'no-store', redirect401: false, timeoutMs: 15000, timeoutToast: !!animate });
     // 401 unauthenticated (or other empty) responses resolve to undefined:
-    // keep the last good lines instead of wiping the panel with a TypeError.
+    // settle only when no newer request was issued, and only against this
+    // scope's own snapshot (see _settleLogsFailure).
     if (data === undefined || data === null) {
-      if (status) status.textContent = t('logs_load_failed');
+      if (mySeq !== _logsLoadSeq) return;
+      _settleLogsFailure(file, tail, box, status, null);
       return;
     }
-    // Drop stale out-of-order responses: only the newest poll may paint.
-    if (mySeq !== _logsLoadSeq) return;
-    _renderLogs(data);
+    // Drop stale out-of-order successes: paint only responses newer than the
+    // last painted result, so overlapping slow polls keep the panel live
+    // instead of freezing it, without ever painting older data over newer.
+    // A response for a scope that is no longer selected is never painted,
+    // even when newer than the last paint: same-scope slow polls still match
+    // the current selection, so only foreign-scope responses are dropped.
+    if (mySeq <= _logsPaintedSeq) return;
+    if (file !== _selectedLogsFile() || tail !== _selectedLogsTail()) return;
+    _logsPaintedSeq = mySeq;
+    _renderLogs(data, file, tail);
   } catch(e) {
-    // Transient failure (timeout, 500, network): preserve the last good
-    // lines so a single bad tick does not blank the panel. Only show the
-    // empty state when we never had lines to keep. Failures stay diagnosable
-    // via status text plus a console warning (no toast spam on a 5s poll).
-    if (typeof console !== 'undefined' && console && typeof console.warn === 'function') {
-      try { console.warn('[logs] poll failed, keeping last good lines:', (e && e.message) || e); } catch (_) {}
-    }
-    if (!_lastLogsLines.length) {
-      box.innerHTML = `<div class="logs-empty">${esc(t('error_prefix') + (e && e.message || e))}</div>`;
-    }
-    if (status) status.textContent = t('logs_load_failed');
+    // Same freshness protocol for errors/timeouts: a late failure must never
+    // clobber a newer settlement (success, empty view or newer failure).
+    if (mySeq !== _logsLoadSeq) return;
+    _settleLogsFailure(file, tail, box, status, e);
   } finally {
     if (animate && refreshBtn) {
       refreshBtn.style.opacity = '';
@@ -4475,18 +4535,22 @@ async function loadLogs(animate) {
   }
 }
 
-function _renderLogs(data) {
+function _renderLogs(data, file, tail) {
   const box = $('logsOutput');
   const status = $('logsStatus');
   if (!box || data === undefined || data === null || typeof data !== 'object') return;
   const rawLines = Array.isArray(data && data.lines) ? data.lines : [];
-  // Only update cache when loading fresh data (not when re-rendering from filter)
+  // Only update cache when loading fresh data (not when re-rendering from filter);
+  // the snapshot is owned by the (file, tail) identity it was fetched for,
+  // preferring the server-echoed values as canonical.
   if (data && !data._fromFilter) {
     _lastLogsLines = rawLines.slice();
     _lastLogsHint = data.hint || '';
     _lastLogsTruncated = !!data.truncated;
     _lastLogsTotalBytes = Number(data.total_bytes || 0);
     _lastLogsMtime = data.mtime || null;
+    _lastLogsFile = (data && data.file) || file || _selectedLogsFile();
+    _lastLogsTail = (data && data.tail) || tail || _selectedLogsTail();
   }
   const displayLines = _filteredLogsLines();
   const hint = data && data.hint ? `<div class="logs-hint">${esc(data.hint)}</div>` : '';

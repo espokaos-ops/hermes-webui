@@ -12635,6 +12635,8 @@ def _handle_logs(handler, parsed) -> bool:
         total_bytes = int(st.st_size)
         read_bytes = min(total_bytes, _LOG_MAX_BYTES)
         seeked = total_bytes > read_bytes
+        fd_total = None
+        fd_mtime = None
         with log_path.open("rb") as fh:
             # Use the open fd's own size: the path may have been replaced or
             # shrunk between stat() and open() (rotation/truncation). The fd
@@ -12669,23 +12671,38 @@ def _handle_logs(handler, parsed) -> bool:
                 except OSError:
                     pass
                 raw = fh.read(read_bytes)
+            # Observe size/mtime from the same open descriptor that produced
+            # the bytes: a later pathname stat could describe a rotated-in
+            # generation instead of the content just returned.
+            try:
+                _st_fd = os.fstat(fh.fileno())
+                fd_total = int(_st_fd.st_size)
+                fd_mtime = _st_fd.st_mtime
+            except OSError:
+                fd_total = None
+                fd_mtime = None
             if seeked and not at_boundary:
                 # Drop only a genuinely partial first line: the seek offset
                 # landed mid-line (or mid-UTF-8 sequence). Never sacrifice a
-                # valid complete line to hide a fragment.
+                # valid complete line to hide a fragment. When the whole
+                # window holds one unfinished long line (no newline at all),
+                # drop the fragment entirely instead of rendering it.
                 nl = raw.find(b"\n")
-                if nl != -1:
-                    raw = raw[nl + 1 :]
+                raw = raw[nl + 1 :] if nl != -1 else b""
         text = raw.decode("utf-8", errors="replace")
         lines = text.splitlines()[-tail:]
-        try:
-            # Re-stat after the read so total_bytes/mtime describe the file
-            # as observed, not a stale pre-read snapshot (TOCTOU).
-            st_after = log_path.stat()
-            total_bytes = int(st_after.st_size)
-            mtime = st_after.st_mtime
-        except OSError:
-            mtime = st.st_mtime
+        if fd_total is not None:
+            total_bytes = fd_total
+            mtime = fd_mtime
+        else:
+            try:
+                # Fallback only: fstat on an open fd effectively never fails,
+                # so reaching here already means an unusual OS error.
+                st_after = log_path.stat()
+                total_bytes = int(st_after.st_size)
+                mtime = st_after.st_mtime
+            except OSError:
+                mtime = st.st_mtime
         return j(handler, {
             "file": file_key,
             "tail": tail,

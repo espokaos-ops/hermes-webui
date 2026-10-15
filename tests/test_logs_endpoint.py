@@ -216,6 +216,23 @@ def test_logs_endpoint_truncated_file_returns_tail_without_stale_prefix():
     assert not any("gen1" in line for line in after["lines"])
 
 
+def test_logs_endpoint_window_without_newline_drops_fragment():
+    logs_dir = TEST_STATE_DIR / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    # One unfinished long line, larger than the 4 MiB window, with no newline
+    # anywhere: the whole fragment must be dropped rather than rendering a
+    # partial line (plus U+FFFD from a split UTF-8 sequence).
+    (logs_dir / "gateway.log").write_text("y" * (4 * 1024 * 1024 + 64), encoding="utf-8")
+
+    data, status = _get_logs("gateway", 1000)
+
+    assert status == 200
+    assert data["truncated"] is True
+    assert data["total_bytes"] > 4 * 1024 * 1024
+    assert data["lines"] == []
+    assert "�" not in "\n".join(data["lines"])
+
+
 def test_logs_endpoint_tests_use_only_synthetic_fixture_content():
     source = __import__("pathlib").Path(__file__).read_text(encoding="utf-8")
     assert "synthetic-log-marker" in source
