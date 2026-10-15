@@ -160,6 +160,10 @@ def test_logs_poll_is_resilient_to_unauthenticated_and_stale_responses():
     assert "_logsPaintedSeq" in load_fn
     assert "mySeq <= _logsPaintedSeq" in load_fn
     assert "mySeq !== _logsLoadSeq" in load_fn
+    # Current-scope ownership: a response for a file/tail that is no longer
+    # selected is never painted, without discarding same-scope slow polls.
+    assert "file !== _selectedLogsFile()" in load_fn
+    assert "_selectedLogsFile" in settle_fn
     # Failure settlement is identity-scoped (never another file's snapshot).
     assert "_lastLogsFile" in settle_fn and "_lastLogsTail" in settle_fn
     # Render must tolerate undefined without throwing (data.tail crash).
@@ -333,6 +337,22 @@ def test_logs_poll_ordering_with_deferred_promises():
         "const d3=loadLogs(false);"
         "__pending[__pending.length-1].resolve(undefined);await tick();await d3;"
         "if(!box.innerHTML.includes('b2'))throw new Error('401/undefined keeps own lines');"
+        # Stale foreign-scope success never paints; current scope paints after.
+        # agent request in flight, switch to errors, old agent resolves first.
+        "fileSel.value='agent';"
+        "let eBase=__pending.length;"
+        "const eAgent=loadLogs(false);"
+        "fileSel.value='errors';"
+        "const eErr=loadLogs(true);"
+        "await tick();"
+        "if(box.innerHTML.includes('b2'))throw new Error('scope change must drop old lines at once');"
+        "__pending[eBase].resolve({file:'agent',tail:200,lines:['stale-agent-line'],"
+        "truncated:false,total_bytes:0,hint:'',mtime:null});await tick();await eAgent;"
+        "if(box.innerHTML.includes('stale-agent-line'))throw new Error('stale foreign-scope success must never paint');"
+        "__pending[eBase+1].resolve({file:'errors',tail:200,lines:['errors-fresh-line'],"
+        "truncated:false,total_bytes:0,hint:'',mtime:null});await tick();await eErr;"
+        "if(!box.innerHTML.includes('errors-fresh-line'))throw new Error('current-scope success must paint after stale drop');"
+        "if(box.innerHTML.includes('stale-agent-line'))throw new Error('foreign lines leaked after current paint');"
         # Visibility catch-up and 5s cadence wiring stay intact.
         "if(!__intervals.some((e)=>e.ms===5000))throw new Error('5s poll cadence must stay');"
         "if(__visHandlers.length!==1)throw new Error('visibility hook must install once');"

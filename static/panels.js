@@ -4447,6 +4447,10 @@ function _syncLogsWrap() {
 // a foreign or missing snapshot becomes an explicit empty/failed state, never
 // another file's data presented as this scope's.
 function _settleLogsFailure(file, tail, box, status, e) {
+  // A settlement for a scope that is no longer selected must not touch the
+  // panel at all: its status text and box belong to the current scope's own
+  // request, which is still in flight or already settled.
+  if (file !== _selectedLogsFile() || tail !== _selectedLogsTail()) return;
   if (typeof console !== 'undefined' && console && typeof console.warn === 'function') {
     try { console.warn('[logs] poll failed, keeping last good lines:', (e && e.message) || e || 'empty response'); } catch (_) {}
   }
@@ -4510,7 +4514,11 @@ async function loadLogs(animate) {
     // Drop stale out-of-order successes: paint only responses newer than the
     // last painted result, so overlapping slow polls keep the panel live
     // instead of freezing it, without ever painting older data over newer.
+    // A response for a scope that is no longer selected is never painted,
+    // even when newer than the last paint: same-scope slow polls still match
+    // the current selection, so only foreign-scope responses are dropped.
     if (mySeq <= _logsPaintedSeq) return;
+    if (file !== _selectedLogsFile() || tail !== _selectedLogsTail()) return;
     _logsPaintedSeq = mySeq;
     _renderLogs(data, file, tail);
   } catch(e) {
