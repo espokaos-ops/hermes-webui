@@ -163,6 +163,7 @@ def test_logs_poll_is_resilient_to_unauthenticated_and_stale_responses():
     # Current-scope ownership: a response for a file/tail that is no longer
     # selected is never painted, without discarding same-scope slow polls.
     assert "file !== _selectedLogsFile()" in load_fn
+    assert "tail !== _selectedLogsTail()" in load_fn
     assert "_selectedLogsFile" in settle_fn
     # Failure settlement is identity-scoped (never another file's snapshot).
     assert "_lastLogsFile" in settle_fn and "_lastLogsTail" in settle_fn
@@ -353,6 +354,25 @@ def test_logs_poll_ordering_with_deferred_promises():
         "truncated:false,total_bytes:0,hint:'',mtime:null});await tick();await eErr;"
         "if(!box.innerHTML.includes('errors-fresh-line'))throw new Error('current-scope success must paint after stale drop');"
         "if(box.innerHTML.includes('stale-agent-line'))throw new Error('foreign lines leaked after current paint');"
+        # Same race on the tail axis: old tail resolves first, must not paint
+        # nor alter the current scope; the tail=500 response paints after.
+        "const tailSel=$('logsTail');"
+        "fileSel.value='errors';tailSel.value='200';"
+        "let fBase=__pending.length;"
+        "const tOld=loadLogs(false);"
+        "tailSel.value='500';"
+        "const tNew=loadLogs(false);"
+        "await tick();"
+        "if(box.innerHTML.includes('errors-fresh-line'))throw new Error('tail change must drop old lines at once');"
+        "__pending[fBase].resolve({file:'errors',tail:200,lines:['stale-tail200-line'],"
+        "truncated:false,total_bytes:0,hint:'',mtime:null});await tick();await tOld;"
+        "if(box.innerHTML.includes('stale-tail200-line'))throw new Error('stale tail success must never paint');"
+        "if(status.textContent!=='logs_loading')throw new Error('stale tail must not alter current status');"
+        "__pending[fBase+1].resolve({file:'errors',tail:500,lines:['tail500-line'],"
+        "truncated:false,total_bytes:0,hint:'',mtime:null});await tick();await tNew;"
+        "if(!box.innerHTML.includes('tail500-line'))throw new Error('current tail success must paint after stale drop');"
+        "if(!status.textContent.includes('/ 500'))throw new Error('status must report current tail');"
+        "if(box.innerHTML.includes('stale-tail200-line'))throw new Error('stale tail leaked after current paint');"
         # Visibility catch-up and 5s cadence wiring stay intact.
         "if(!__intervals.some((e)=>e.ms===5000))throw new Error('5s poll cadence must stay');"
         "if(__visHandlers.length!==1)throw new Error('visibility hook must install once');"
