@@ -12707,7 +12707,13 @@ def _handle_logs(handler, parsed) -> bool:
             "file": file_key,
             "tail": tail,
             "lines": lines,
-            "truncated": total_bytes > read_bytes,
+            # ``truncated`` describes the read that was actually performed:
+            # True only when the window had to skip leading bytes to honor the
+            # byte cap at read time. It is deliberately not derived from a
+            # post-read fstat size -- a file that grows between the read and
+            # the fstat would otherwise be reported as truncated even though
+            # nothing was skipped.
+            "truncated": seeked,
             "total_bytes": total_bytes,
             "mtime": mtime,
             "hint": "",

@@ -45,13 +45,23 @@ let _lastLogsMtime = null;
 let _logsLoadSeq = 0;
 let _logsVisibilityHookInstalled = false;
 // Ownership of the Logs panel: every poll is issued with a sequence number
-// and a (file, tail) identity. Successes paint only when newer than the last
-// painted result (never "latest issued": overlapping slow polls must still
-// paint). Failures settle only when no newer request was issued, so a late
-// error can never clobber a newer success, empty view or failure state.
-let _logsPaintedSeq = 0;
+// and a (file, tail) identity. Every completed request (success, empty
+// success, failure or 401/undefined) raises the settlement floor
+// (_logsSettledSeq); a response below the floor is dropped. So an old success
+// can never paint over a newer failure/401, an old failure can never clobber
+// a newer success, and overlapping slow polls still settle as long as nothing
+// newer has settled -- a merely started request never freezes the panel.
+let _logsSettledSeq = 0;
+// Manual refreshes own the refresh button as a group: it stays disabled until
+// the last in-flight manual request settles.
+let _logsManualPending = 0;
 let _lastLogsFile = null;
 let _lastLogsTail = null;
+// True while _lastLogsLines is a genuinely accepted snapshot for
+// (_lastLogsFile, _lastLogsTail) -- including a valid empty one. False means
+// "no snapshot": a later failure for the same scope must not mistake a valid
+// empty view for a missing one (or the reverse).
+let _logsHasSnapshot = false;
 
 // Map of panel names → i18n keys for the app titlebar label.
 const APP_TITLEBAR_KEYS = {
@@ -4443,9 +4453,11 @@ function _syncLogsWrap() {
 }
 
 // Settle a failed logs request for the scope (file, tail) it was issued for.
-// A scope's own last-good lines survive (status still reports the failure);
-// a foreign or missing snapshot becomes an explicit empty/failed state, never
-// another file's data presented as this scope's.
+// A scope's own last valid snapshot survives -- a valid empty snapshot
+// included: the failure is reported in the status line without destroying the
+// last valid view, and "empty" is never confused with "no previous data".
+// Only a scope with no snapshot at all falls back to the explicit failed
+// empty state, never another file's data presented as this scope's.
 function _settleLogsFailure(file, tail, box, status, e) {
   // A settlement for a scope that is no longer selected must not touch the
   // panel at all: its status text and box belong to the current scope's own
@@ -4454,7 +4466,7 @@ function _settleLogsFailure(file, tail, box, status, e) {
   if (typeof console !== 'undefined' && console && typeof console.warn === 'function') {
     try { console.warn('[logs] poll failed, keeping last good lines:', (e && e.message) || e || 'empty response'); } catch (_) {}
   }
-  if (!(_lastLogsFile === file && _lastLogsTail === tail && _lastLogsLines.length)) {
+  if (!(_lastLogsFile === file && _lastLogsTail === tail && _logsHasSnapshot)) {
     _lastLogsLines = [];
     _lastLogsHint = '';
     _lastLogsTruncated = false;
@@ -4462,10 +4474,31 @@ function _settleLogsFailure(file, tail, box, status, e) {
     _lastLogsMtime = null;
     _lastLogsFile = file;
     _lastLogsTail = tail;
+    _logsHasSnapshot = false;
     const msg = e ? (e.message || e) : t('logs_load_failed');
     box.innerHTML = `<div class="logs-empty">${esc(t('error_prefix') + msg)}</div>`;
   }
   if (status) status.textContent = t('logs_load_failed');
+}
+
+// One freshness policy for every outcome of one request. Any completed
+// request raises the settlement floor first (_logsSettledSeq), so older
+// responses -- successes included -- are dropped no matter which outcome
+// settled them (a newer failure/401 invalidates an old success, and a newer
+// success invalidates an old failure). A merely started request never raises
+// the floor: same-scope slow responses still settle while nothing newer has.
+// Only the still-selected scope may touch the panel; a success (including a
+// valid empty one) paints, a failure/401/undefined keeps this scope's own
+// last valid view and reports the failure in the status line.
+function _settleLogsResponse(mySeq, file, tail, box, status, e, data) {
+  if (mySeq <= _logsSettledSeq) return;
+  _logsSettledSeq = mySeq;
+  if (file !== _selectedLogsFile() || tail !== _selectedLogsTail()) return;
+  if (data !== undefined && data !== null) {
+    _renderLogs(data, file, tail);
+    return;
+  }
+  _settleLogsFailure(file, tail, box, status, e || null);
 }
 
 async function loadLogs(animate) {
@@ -4474,6 +4507,10 @@ async function loadLogs(animate) {
   const refreshBtn = $('logsRefreshBtn');
   if (!box) return;
   if (animate && refreshBtn) {
+    // Manual refreshes own the button as a group: overlapping clicks keep it
+    // disabled until the LAST manual request settles, so a fast older click
+    // can never re-enable it while a newer one is still in flight.
+    _logsManualPending += 1;
     refreshBtn.style.opacity = '0.5';
     refreshBtn.disabled = true;
   }
@@ -4491,6 +4528,7 @@ async function loadLogs(animate) {
     _lastLogsMtime = null;
     _lastLogsFile = null;
     _lastLogsTail = null;
+    _logsHasSnapshot = false;
     box.innerHTML = `<div class="logs-empty">${esc(t('logs_loading'))}</div>`;
   }
   const mySeq = ++_logsLoadSeq;
@@ -4503,33 +4541,18 @@ async function loadLogs(animate) {
     // timeout toast so the click gets feedback.
     const data = await api('/api/logs?file=' + encodeURIComponent(file) + '&tail=' + encodeURIComponent(tail),
       { cache: 'no-store', redirect401: false, timeoutMs: 15000, timeoutToast: !!animate });
-    // 401 unauthenticated (or other empty) responses resolve to undefined:
-    // settle only when no newer request was issued, and only against this
-    // scope's own snapshot (see _settleLogsFailure).
-    if (data === undefined || data === null) {
-      if (mySeq !== _logsLoadSeq) return;
-      _settleLogsFailure(file, tail, box, status, null);
-      return;
-    }
-    // Drop stale out-of-order successes: paint only responses newer than the
-    // last painted result, so overlapping slow polls keep the panel live
-    // instead of freezing it, without ever painting older data over newer.
-    // A response for a scope that is no longer selected is never painted,
-    // even when newer than the last paint: same-scope slow polls still match
-    // the current selection, so only foreign-scope responses are dropped.
-    if (mySeq <= _logsPaintedSeq) return;
-    if (file !== _selectedLogsFile() || tail !== _selectedLogsTail()) return;
-    _logsPaintedSeq = mySeq;
-    _renderLogs(data, file, tail);
+    // Success, empty success, 401/undefined and errors all settle through the
+    // single settlement policy in _settleLogsResponse.
+    _settleLogsResponse(mySeq, file, tail, box, status, null, data);
   } catch(e) {
-    // Same freshness protocol for errors/timeouts: a late failure must never
-    // clobber a newer settlement (success, empty view or newer failure).
-    if (mySeq !== _logsLoadSeq) return;
-    _settleLogsFailure(file, tail, box, status, e);
+    _settleLogsResponse(mySeq, file, tail, box, status, e);
   } finally {
     if (animate && refreshBtn) {
-      refreshBtn.style.opacity = '';
-      refreshBtn.disabled = false;
+      _logsManualPending = Math.max(0, _logsManualPending - 1);
+      if (_logsManualPending === 0) {
+        refreshBtn.style.opacity = '';
+        refreshBtn.disabled = false;
+      }
     }
     _syncLogsAutoRefresh();
   }
@@ -4542,7 +4565,9 @@ function _renderLogs(data, file, tail) {
   const rawLines = Array.isArray(data && data.lines) ? data.lines : [];
   // Only update cache when loading fresh data (not when re-rendering from filter);
   // the snapshot is owned by the (file, tail) identity it was fetched for,
-  // preferring the server-echoed values as canonical.
+  // preferring the server-echoed values as canonical. A valid empty snapshot
+  // counts as data: mark it accepted so a later same-scope failure reports in
+  // the status without wiping this view.
   if (data && !data._fromFilter) {
     _lastLogsLines = rawLines.slice();
     _lastLogsHint = data.hint || '';
@@ -4551,6 +4576,7 @@ function _renderLogs(data, file, tail) {
     _lastLogsMtime = data.mtime || null;
     _lastLogsFile = (data && data.file) || file || _selectedLogsFile();
     _lastLogsTail = (data && data.tail) || tail || _selectedLogsTail();
+    _logsHasSnapshot = true;
   }
   const displayLines = _filteredLogsLines();
   const hint = data && data.hint ? `<div class="logs-hint">${esc(data.hint)}</div>` : '';

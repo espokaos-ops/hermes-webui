@@ -233,6 +233,87 @@ def test_logs_endpoint_window_without_newline_drops_fragment():
     assert "�" not in "\n".join(data["lines"])
 
 
+def test_logs_truncated_reflects_actual_read_not_post_read_growth(monkeypatch):
+    """Deterministic growth race: the file grows between read and post-read fstat.
+
+    ``truncated`` must describe the read actually performed -- nothing was
+    skipped because the whole window fit under the 4 MiB cap -- even though
+    the descriptor's size observed *after* the read is larger. The race is
+    simulated by wrapping ``os.fstat`` for the log's own fd inside
+    ``_handle_logs``: the first call (pre-read sizing) reports the real size,
+    every later call reports the real size + 8 MiB. A derivation such as
+    ``total_bytes > read_bytes`` from the post-read size would therefore flip
+    ``truncated`` to True; the read-time ``seeked`` value must not.
+    """
+    import io
+    import os
+    import types
+
+    import api.routes as routes_mod
+
+    logs_dir = TEST_STATE_DIR / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = (logs_dir / "agent.log").resolve()
+    body = "".join(
+        f"2026-05-04 INFO synthetic-log-marker growth line {i}\n" for i in range(5)
+    )
+    log_path.write_text(body, encoding="utf-8")
+    real_size = log_path.stat().st_size
+
+    real_fstat = os.fstat
+    target = str(log_path)
+    state = {"calls": 0}
+
+    def fake_fstat(fd):
+        st = real_fstat(fd)
+        try:
+            fd_target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            fd_target = ""
+        if fd_target != target:
+            return st
+        state["calls"] += 1
+        if state["calls"] == 1:
+            return st
+        grown = list(st)
+        grown[6] = st.st_size + 8 * 1024 * 1024  # st_size grew after the read
+        return os.stat_result(grown)
+
+    class _StubHandler:
+        def __init__(self):
+            self.status = None
+            self.sent_headers = []
+            self.wfile = io.BytesIO()
+
+        def send_response(self, status):
+            self.status = status
+
+        def send_header(self, key, value):
+            self.sent_headers.append((key, value))
+
+        def end_headers(self):
+            pass
+
+    monkeypatch.setattr(
+        "api.profiles.get_active_hermes_home", lambda: str(TEST_STATE_DIR)
+    )
+    monkeypatch.setattr(routes_mod.os, "fstat", fake_fstat)
+
+    handler = _StubHandler()
+    routes_mod._handle_logs(handler, types.SimpleNamespace(query="file=agent&tail=200"))
+
+    assert handler.status == 200
+    payload = json.loads(handler.wfile.getvalue())
+    assert payload["lines"] == body.splitlines()
+    # The window fit whole: nothing was skipped, so truncated must stay False
+    # even though the post-read descriptor size now exceeds the read window.
+    assert payload["truncated"] is False
+    # Size and mtime stay bound to the same fd that produced the bytes.
+    assert payload["total_bytes"] == real_size + 8 * 1024 * 1024
+    assert payload["mtime"] is not None
+    assert state["calls"] == 2
+
+
 def test_logs_endpoint_tests_use_only_synthetic_fixture_content():
     source = __import__("pathlib").Path(__file__).read_text(encoding="utf-8")
     assert "synthetic-log-marker" in source
