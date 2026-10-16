@@ -240,10 +240,12 @@ def test_logs_truncated_reflects_actual_read_not_post_read_growth(monkeypatch):
     skipped because the whole window fit under the 4 MiB cap -- even though
     the descriptor's size observed *after* the read is larger. The race is
     simulated by wrapping ``os.fstat`` for the log's own fd inside
-    ``_handle_logs``: the first call (pre-read sizing) reports the real size,
-    every later call reports the real size + 8 MiB. A derivation such as
-    ``total_bytes > read_bytes`` from the post-read size would therefore flip
-    ``truncated`` to True; the read-time ``seeked`` value must not.
+    ``_handle_logs``: the fd is matched by ``st_dev``/``st_ino`` (portable, no
+    ``/proc/self/fd`` dependency), the first call (pre-read sizing) reports the
+    real size, every later call reports the real size + 8 MiB. A derivation
+    such as ``total_bytes > read_bytes`` from the post-read size would
+    therefore flip ``truncated`` to True; the read-time ``seeked`` value must
+    not.
     """
     import io
     import os
@@ -258,19 +260,18 @@ def test_logs_truncated_reflects_actual_read_not_post_read_growth(monkeypatch):
         f"2026-05-04 INFO synthetic-log-marker growth line {i}\n" for i in range(5)
     )
     log_path.write_text(body, encoding="utf-8")
-    real_size = log_path.stat().st_size
+    target_identity = log_path.stat()
+    real_size = target_identity.st_size
 
     real_fstat = os.fstat
-    target = str(log_path)
     state = {"calls": 0}
 
     def fake_fstat(fd):
         st = real_fstat(fd)
-        try:
-            fd_target = os.readlink(f"/proc/self/fd/{fd}")
-        except OSError:
-            fd_target = ""
-        if fd_target != target:
+        if (st.st_dev, st.st_ino) != (
+            target_identity.st_dev,
+            target_identity.st_ino,
+        ):
             return st
         state["calls"] += 1
         if state["calls"] == 1:
